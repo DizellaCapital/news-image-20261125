@@ -1,553 +1,587 @@
 #!/usr/bin/env python3
-"""Draw the Wednesday 25 November 2026 front page (v3).
+"""Render the Wednesday 25 November 2026 front page (v3) as a 1024x1024 PNG.
 
-Local-only renderer (Pillow). Reads stories_20261125-v3.json next to
-this file and writes entry.png, 1024x1024, deterministic: the same
-input bytes always produce the same output bytes. The grader never
-runs this file; main.py only copies the finished entry.png.
-
-v3 lever (freshness fix + 13 scenes + UTC strip): the two stale
-Tuesday leads are gone; Wednesday's Kospi crash, the Tiangong
-docking and the US tariff plan lead; 13 stories carry pictures
-(3 leads + 10 grid); a "THE DAY IN UTC" strip times the day.
+Architecture: a tiny flow engine. The page is a list of section callables
+(SECTIONS), each receiving a Page object that carries the canvas, the
+cursor and the story data. Illustrations live in a SCENES registry keyed
+by story number, so the layout code never knows how a scene is drawn.
+Everything is drawn with Pillow only; no network, no randomness.
+Run:  python3 render.py  ->  writes entry.png next to this file.
 """
+
 import json
 import os
+import sys
 
 from PIL import Image, ImageDraw, ImageFont
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.join(HERE, "stories_20261125-v3.json")
-OUT = os.path.join(HERE, "entry.png")
+W = H = 1024
+MARGIN = 22
+CW = W - 2 * MARGIN  # content width
 
-W, H = 1024, 1024
-CREAM = (247, 241, 222)
-INK = (26, 26, 26)
-RED = (178, 34, 34)
-GREY = (90, 90, 90)
-RULE = (60, 60, 60)
+# ---------------------------------------------------------------- palette
+INK = (26, 22, 18)
+PAPER = (250, 244, 228)
+RED = (178, 30, 26)
+DARKRED = (140, 20, 18)
+BLACK = (12, 12, 14)
+NAVY = (16, 24, 52)
+SKY = (168, 208, 232)
+TAN = (232, 214, 170)
+GREY = (120, 118, 112)
+MIDGREY = (90, 88, 84)
 
-SERIF = "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"
-SERIF_B = "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"
-SERIF_I = "/usr/share/fonts/truetype/noto/NotoSerif-Italic.ttf"
-SANS = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-SANS_B = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+REGION_FILL = {
+    "EUROPE": (28, 62, 122),
+    "AMERICAS": (104, 52, 150),
+    "ASIA-PACIFIC": (16, 130, 118),
+    "MIDDLE EAST": (198, 148, 32),
+    "AFRICA": (214, 96, 28),
+    "WORLD": (120, 118, 112),
+}
+
+# ---------------------------------------------------------------- fonts
+_FDIR = "/usr/share/fonts/truetype/liberation"
 
 
-def font(path, size):
-    try:
-        return ImageFont.truetype(path, size)
-    except OSError:
-        return ImageFont.truetype(SERIF, size)
+def face(kind, size):
+    """Load a Liberation face; kind is one of serif/serif-b/serif-i/sans/..."""
+    names = {
+        "serif": "LiberationSerif-Regular.ttf",
+        "serif-b": "LiberationSerif-Bold.ttf",
+        "serif-i": "LiberationSerif-Italic.ttf",
+        "serif-bi": "LiberationSerif-BoldItalic.ttf",
+        "sans": "LiberationSans-Regular.ttf",
+        "sans-b": "LiberationSans-Bold.ttf",
+        "sans-i": "LiberationSans-Italic.ttf",
+    }
+    path = os.path.join(_FDIR, names[kind])
+    return ImageFont.truetype(path, size)
 
 
-def wrap(draw, text, fnt, max_w):
+def fit(font, text, max_w):
+    """Split text into lines that fit max_w, word by word."""
     words = text.split()
     lines, cur = [], ""
     for word in words:
         trial = (cur + " " + word).strip()
-        if draw.textlength(trial, font=fnt) <= max_w:
+        if font.getlength(trial) <= max_w or not cur:
             cur = trial
         else:
-            if cur:
-                lines.append(cur)
+            lines.append(cur)
             cur = word
     if cur:
         lines.append(cur)
     return lines
 
 
-def fit_font(draw, text, path, start, max_w, minimum=10):
-    size = start
-    while size > minimum:
-        fnt = font(path, size)
-        if draw.textlength(text, font=fnt) <= max_w:
-            return fnt
-        size -= 2
-    return font(path, minimum)
+class Page:
+    """Canvas + vertical cursor + small drawing helpers."""
+
+    def __init__(self):
+        self.img = Image.new("RGB", (W, H), PAPER)
+        self.d = ImageDraw.Draw(self.img)
+        self.y = 0
+
+    # -- primitives ------------------------------------------------------
+    def bar(self, h, fill):
+        self.d.rectangle([0, self.y, W, self.y + h - 1], fill=fill)
+        self.y += h
+
+    def rule(self, weight=1, color=INK, gap=0):
+        self.d.line([(MARGIN, self.y), (W - MARGIN, self.y)], fill=color,
+                    width=weight)
+        self.y += weight + gap
+
+    def text(self, x, y, s, font, fill=INK, anchor="la"):
+        self.d.text((x, y), s, font=font, fill=fill, anchor=anchor)
+
+    def para(self, x, y, s, font, max_w, fill=INK, leading=None):
+        """Word-wrapped paragraph; returns y just below the last line."""
+        lh = leading or int(font.size * 1.18)
+        for line in fit(font, s, max_w):
+            self.d.text((x, y), line, font=font, fill=fill)
+            y += lh
+        return y
+
+    def centred(self, cx, y, s, font, fill=INK):
+        self.d.text((cx, y), s, font=font, fill=fill, anchor="ma")
+
+    # -- shared blocks ---------------------------------------------------
+    def kicker_strip(self, x, y, w, label, fill=RED):
+        """Red strip with white bold sans label (story kicker)."""
+        self.d.rectangle([x, y, x + w - 1, y + 15], fill=fill)
+        self.d.text((x + 6, y + 2), label, font=face("sans-b", 10),
+                    fill=(255, 255, 255))
+        return y + 16
+
+    def caption_bar(self, x, y, w, label, fill=BLACK):
+        self.d.rectangle([x, y, x + w - 1, y + 15], fill=fill)
+        self.d.text((x + 6, y + 2), label, font=face("sans-b", 10),
+                    fill=(255, 255, 255))
+        return y + 16
 
 
-def text_block(draw, xy, lines, fnt, fill, leading=None):
-    x, y = xy
-    if leading is None:
-        leading = int(fnt.size * 1.18)
-    for line in lines:
-        draw.text((x, y), line, font=fnt, fill=fill)
-        y += leading
-    return y
+def load_data(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
 
 
-def band(draw, box, colors):
-    """Vertical gradient bands across box (deterministic)."""
-    x0, y0, x1, y1 = box
-    n = len(colors)
-    span = (y1 - y0) / n
-    for i, col in enumerate(colors):
-        draw.rectangle([x0, y0 + i * span, x1, y0 + (i + 1) * span + 1],
-                       fill=col)
+def by_number(data, n):
+    for pool in (data["leads"], data["grid"]):
+        for story in pool:
+            if story["pin"] == n:
+                return story
+    return None
+
+# ---------------------------------------------------------------- scenes
+# Each painter receives (draw, x, y, w, h) and draws one flat illustration.
+# Numbers match the story pins; the registry is the only place scenes live.
+
+def _stars(d, x, y, w, h, n=14, seed=7):
+    import random
+    rng = random.Random(seed)
+    for _ in range(n):
+        sx = x + rng.randint(4, w - 4)
+        sy = y + rng.randint(4, h - 18)
+        r = rng.choice([1, 1, 2])
+        d.ellipse([sx - r, sy - r, sx + r, sy + r], fill=(255, 255, 255))
 
 
-# ---------------------------------------------------------------- lead pictures
-def pic_kospi(d, box):
-    """Falling chip-market chart on a dark board."""
-    x0, y0, x1, y1 = box
-    d.rectangle(box, fill=(14, 18, 30))
-    for gy in range(y0 + 18, y1 - 8, 18):
-        d.line([(x0 + 8, gy), (x1 - 8, gy)], fill=(32, 40, 58), width=1)
-    pts = []
-    n = 16
-    for i in range(n):
-        px = x0 + 14 + i * (x1 - x0 - 28) // (n - 1)
-        py = y0 + 22 + int((i * i) * (y1 - y0 - 48) / ((n - 1) * (n - 1))) \
-            + (i % 3) * 2
-        pts.append((px, py))
-    for a, b in zip(pts, pts[1:]):
-        d.line([a, b], fill=(235, 70, 60), width=3)
-    d.polygon([(pts[-1][0] - 8, pts[-1][1] - 12), (pts[-1][0] + 8, pts[-1][1]),
-               (pts[-1][0] - 8, pts[-1][1] + 2)], fill=(235, 70, 60))
+def scene_kospi(d, x, y, w, h):
+    d.rectangle([x, y, x + w - 1, y + h - 1], fill=NAVY)
     # chip
-    cx, cy = x0 + 58, y0 + 34
-    d.rectangle([cx - 20, cy - 14, cx + 20, cy + 14], fill=(20, 90, 78),
-                outline=(212, 175, 55), width=2)
-    d.rectangle([cx - 6, cy - 5, cx + 6, cy + 5], fill=(212, 175, 55))
+    cx, cy = x + 26, y + 18
+    d.rectangle([cx, cy, cx + 44, cy + 34], fill=(18, 120, 90))
+    d.rectangle([cx + 12, cy + 9, cx + 32, cy + 25], fill=(232, 190, 60))
     for i in range(3):
-        px = cx - 12 + i * 12
-        d.line([(px, cy - 20), (px, cy - 14)], fill=(212, 175, 55), width=2)
-        d.line([(px, cy + 14), (px, cy + 20)], fill=(212, 175, 55), width=2)
-    d.rectangle([x1 - 92, y0 + 8, x1 - 8, y0 + 30], fill=RED)
-    d.text((x1 - 87, y0 + 11), "−6.2%", font=font(SANS_B, 14),
-           fill=(255, 255, 255))
-    d.text((x0 + 10, y1 - 18), "KOSPI · WED CLOSE",
-           font=font(SANS_B, 10), fill=(160, 170, 190))
+        d.line([(cx + 6 + i * 14, cy - 5), (cx + 6 + i * 14, cy)], fill=(200, 200, 200), width=2)
+        d.line([(cx + 6 + i * 14, cy + 34), (cx + 6 + i * 14, cy + 39)], fill=(200, 200, 200), width=2)
+    # falling line
+    pts = [(x + 92, y + 22), (x + 150, y + 30), (x + 195, y + 26),
+           (x + 235, y + 48), (x + 265, y + 66), (x + 292, y + 82)]
+    d.line(pts, fill=(235, 70, 60), width=3)
+    d.polygon([(x + 292, y + 82), (x + 282, y + 78), (x + 290, y + 92)],
+              fill=(235, 70, 60))
+    # red badge
+    d.rectangle([x + w - 88, y + 10, x + w - 12, y + 32], fill=RED)
+    d.text((x + w - 50, y + 14), "−6.2%", font=face("sans-b", 15),
+           fill=(255, 255, 255), anchor="ma")
 
 
-def pic_tiangong(d, box):
-    """Night launch: rocket rising to a station, two small flags."""
-    x0, y0, x1, y1 = box
-    band(d, box, [(8, 12, 38), (16, 26, 60), (30, 44, 78)])
-    for sx, sy in ((x0 + 22, y0 + 14), (x0 + 90, y0 + 26), (x0 + 160, y0 + 12),
-                   (x0 + 210, y0 + 34), (x0 + 260, y0 + 18), (x0 + 130, y0 + 44)):
-        d.ellipse([sx - 2, sy - 2, sx + 2, sy + 2], fill=(255, 255, 255))
-    # station
-    sx, sy = x1 - 96, y0 + 22
-    d.rectangle([sx - 34, sy - 6, sx + 34, sy + 6], fill=(200, 205, 215))
-    d.rectangle([sx - 52, sy - 10, sx - 34, sy + 10], fill=(60, 90, 160))
-    d.rectangle([sx + 34, sy - 10, sx + 52, sy + 10], fill=(60, 90, 160))
-    d.rectangle([sx - 8, sy - 14, sx + 8, sy + 14], fill=(220, 225, 235))
+def scene_space(d, x, y, w, h):
+    d.rectangle([x, y, x + w - 1, y + h - 1], fill=(10, 16, 44))
+    _stars(d, x, y, w, h, n=16, seed=11)
     # rocket
-    rx = x0 + 56
-    d.polygon([(rx - 12, y0 + 62), (rx + 12, y0 + 62), (rx, y0 + 34)],
-              fill=(235, 235, 230))
-    d.rectangle([rx - 12, y0 + 62, rx + 12, y1 - 46], fill=(235, 235, 230))
-    d.polygon([(rx - 12, y1 - 46), (rx - 22, y1 - 30), (rx - 12, y1 - 34)],
-              fill=(178, 34, 34))
-    d.polygon([(rx + 12, y1 - 46), (rx + 22, y1 - 30), (rx + 12, y1 - 34)],
-              fill=(178, 34, 34))
-    d.ellipse([rx - 8, y1 - 30, rx + 8, y1 - 12], fill=(255, 170, 40))
-    d.ellipse([rx - 5, y1 - 24, rx + 5, y1 - 10], fill=(255, 220, 90))
-    # ground + flags
-    d.rectangle([x0, y1 - 26, x1, y1], fill=(52, 44, 36))
-    d.line([(x0 + 150, y1 - 52), (x0 + 150, y1 - 26)], fill=(220, 220, 220),
-           width=2)
-    d.rectangle([x0 + 150, y1 - 52, x0 + 174, y1 - 40], fill=(20, 120, 60))
-    d.rectangle([x0 + 182, y1 - 52, x0 + 206, y1 - 40], fill=(220, 40, 40))
-    d.text((x1 - 108, y1 - 20), "SHENZHOU-24", font=font(SANS_B, 10),
-           fill=(200, 210, 225))
+    rx, ry = x + 62, y + 34
+    d.polygon([(rx, ry), (rx - 16, ry + 44), (rx + 16, ry + 44)], fill=(240, 240, 240))
+    d.polygon([(rx - 16, ry + 44), (rx - 26, ry + 58), (rx - 10, ry + 50)], fill=RED)
+    d.polygon([(rx + 16, ry + 44), (rx + 26, ry + 58), (rx + 10, ry + 50)], fill=RED)
+    d.rectangle([rx - 4, ry + 44, rx + 4, ry + 58], fill=(250, 180, 60))
+    # station
+    sx, sy = x + 180, y + 26
+    d.rectangle([sx, sy, sx + 96, sy + 12], fill=(200, 205, 215))
+    d.rectangle([sx + 18, sy - 8, sx + 40, sy + 20], fill=(150, 158, 175))
+    d.rectangle([sx + 56, sy - 8, sx + 78, sy + 20], fill=(150, 158, 175))
+    d.rectangle([sx - 26, sy + 2, sx, sy + 10], fill=(60, 110, 190))
+    d.rectangle([sx + 96, sy + 2, sx + 122, sy + 10], fill=(60, 110, 190))
+    # ground flags
+    d.rectangle([x + 150, y + h - 26, x + 170, y + h - 14], fill=(20, 120, 70))
+    d.rectangle([x + 176, y + h - 26, x + 196, y + h - 14], fill=RED)
 
 
-def pic_tariff(d, box):
-    """Container ship with a red UP TO 20% stamp, top left."""
-    x0, y0, x1, y1 = box
-    band(d, box, [(150, 200, 225), (120, 180, 210), (90, 150, 190)])
-    d.rectangle([x0, y1 - 34, x1, y1], fill=(28, 70, 120))
-    for wx in range(x0 + 10, x1 - 10, 30):
-        d.line([(wx, y1 - 16), (wx + 16, y1 - 16)], fill=(200, 225, 240),
-               width=2)
-    # hull + containers, shifted right to leave the stamp clear
-    d.polygon([(x0 + 22, y1 - 34), (x1 - 22, y1 - 34), (x1 - 44, y1 - 16),
-               (x0 + 44, y1 - 16)], fill=(30, 30, 36))
-    cols = [(220, 60, 50), (40, 110, 180), (240, 200, 60), (60, 160, 90)]
-    for i, col in enumerate(cols):
-        cx = x0 + 112 + i * 42
-        d.rectangle([cx, y1 - 66, cx + 38, y1 - 36], fill=col,
-                    outline=(255, 255, 255), width=1)
-        d.rectangle([cx, y1 - 92, cx + 38, y1 - 68], fill=cols[(i + 2) % 4],
-                    outline=(255, 255, 255), width=1)
-    # bridge
-    d.rectangle([x1 - 58, y1 - 92, x1 - 28, y1 - 34], fill=(240, 240, 235))
-    for r in range(3):
-        d.rectangle([x1 - 54, y1 - 88 + r * 12, x1 - 32, y1 - 80 + r * 12],
-                    fill=(40, 90, 140))
-    # stamp, top left in clear sky
-    d.ellipse([x0 + 10, y0 + 8, x0 + 100, y0 + 62], outline=RED, width=4)
-    d.ellipse([x0 + 18, y0 + 16, x0 + 92, y0 + 54], outline=RED, width=2)
-    d.text((x0 + 30, y0 + 22), "UP TO", font=font(SANS_B, 12), fill=RED)
-    d.text((x0 + 30, y0 + 36), "20%", font=font(SANS_B, 17), fill=RED)
-
-
-# ---------------------------------------------------------------- grid pictures
-def pic_hormuz(d, box):
-    x0, y0, x1, y1 = box
-    band(d, box, [(250, 180, 110), (235, 140, 70), (200, 110, 60)])
-    d.rectangle([x0, y1 - 22, x1, y1], fill=(24, 70, 110))
-    d.rectangle([x0 + 30, y1 - 40, x0 + 130, y1 - 22], fill=(40, 40, 46))
-    d.rectangle([x0 + 52, y1 - 52, x0 + 70, y1 - 40], fill=(40, 40, 46))
-    d.ellipse([x0 + 76, y0 + 6, x0 + 104, y0 + 30], fill=(255, 170, 40))
-    for dx, dy in ((-14, 0), (14, 0), (0, -12), (0, 12)):
-        d.line([(x0 + 90, y0 + 18), (x0 + 90 + dx, y0 + 18 + dy)],
-               fill=(255, 170, 40), width=3)
-    d.ellipse([x1 - 40, y0 + 14, x1 - 22, y0 + 30], fill=(90, 90, 95))
-    d.ellipse([x1 - 52, y0 + 6, x1 - 36, y0 + 20], fill=(110, 110, 115))
-    d.text((x1 - 62, y1 - 20), "2 TANKERS", font=font(SANS_B, 10),
-           fill=(255, 255, 255))
-
-
-def pic_solomon(d, box):
-    x0, y0, x1, y1 = box
-    band(d, box, [(150, 200, 225), (120, 180, 210)])
-    d.ellipse([x0 + 132, y0 + 6, x0 + 152, y0 + 26], fill=(255, 220, 120))
-    d.rectangle([x0, y1 - 22, x1, y1], fill=(38, 110, 160))
-    d.ellipse([x0 + 8, y1 - 44, x1 - 8, y1 - 16], fill=(74, 140, 74))
-    d.line([(x0 + 92, y1 - 48), (x0 + 92, y1 - 18)], fill=(60, 50, 40),
-           width=3)
-    d.polygon([(x0 + 92, y1 - 48), (x0 + 134, y1 - 40), (x0 + 92, y1 - 32)],
-              fill=(0, 60, 140))
-    d.polygon([(x0 + 26, y1 - 28), (x0 + 48, y1 - 28), (x0 + 38, y1 - 42)],
-              fill=(120, 90, 50))
-    d.text((x1 - 66, y0 + 4), "TREATY", font=font(SANS_B, 10),
-           fill=(255, 255, 255))
-
-
-def pic_energy(d, box):
-    x0, y0, x1, y1 = box
-    d.rectangle(box, fill=(232, 226, 205))
-    d.polygon([(x0 + 30, y0 + 26), (x0 + 78, y0 + 8), (x0 + 126, y0 + 26)],
-              fill=(120, 40, 40))
-    d.rectangle([x0 + 38, y0 + 26, x0 + 118, y1 - 8], fill=(250, 246, 235),
-                outline=(120, 40, 40), width=2)
-    d.ellipse([x0 + 66, y0 + 34, x0 + 90, y0 + 52], fill=(255, 170, 40))
-    d.polygon([(x0 + 78, y0 + 32), (x0 + 86, y0 + 44), (x0 + 78, y0 + 50),
-               (x0 + 70, y0 + 44)], fill=(235, 90, 30))
-    d.text((x1 - 62, y0 + 8), "+26%", font=font(SANS_B, 18), fill=RED)
-    d.text((x1 - 62, y0 + 30), "£2,166", font=font(SANS_B, 11), fill=INK)
-
-
-def pic_mine(d, box):
-    x0, y0, x1, y1 = box
-    band(d, box, [(200, 170, 120), (170, 130, 80)])
-    d.polygon([(x0 + 20, y0 + 10), (x0 + 120, y0 + 10), (x0 + 96, y1 - 8),
-               (x0 + 44, y1 - 8)], fill=(90, 60, 30))
-    d.rectangle([x0 + 52, y1 - 26, x0 + 88, y1 - 8], fill=(40, 90, 140))
-    for wx in range(x0 + 8, x1 - 8, 22):
-        d.line([(wx, y0 + 34), (wx + 12, y0 + 34)], fill=(140, 110, 70),
-               width=2)
-    d.rectangle([x1 - 52, y0 + 6, x1 - 8, y0 + 24], fill=RED)
-    d.text((x1 - 48, y0 + 9), "26", font=font(SANS_B, 13),
-           fill=(255, 255, 255))
-    d.text((x0 + 8, y1 - 16), "100 m DOWN", font=font(SANS_B, 9),
-           fill=(255, 255, 255))
-
-
-def pic_gaza(d, box):
-    x0, y0, x1, y1 = box
-    band(d, box, [(240, 200, 140), (220, 170, 110)])
-    d.ellipse([x0 + 14, y0 + 8, x0 + 34, y0 + 28], fill=(255, 220, 120))
-    for bx, bh in ((x0 + 16, 26), (x0 + 52, 38), (x0 + 92, 30),
-                   (x0 + 128, 42)):
-        d.rectangle([bx, y1 - bh, bx + 30, y1], fill=(70, 62, 58))
-    d.ellipse([x1 - 52, y0 + 8, x1 - 30, y0 + 26], fill=(90, 90, 95))
-    d.ellipse([x1 - 64, y0 + 18, x1 - 44, y0 + 34], fill=(110, 110, 115))
-    d.ellipse([x1 - 40, y0 + 26, x1 - 22, y0 + 40], fill=(130, 130, 135))
-
-
-def pic_cia(d, box):
-    x0, y0, x1, y1 = box
-    d.rectangle(box, fill=(28, 30, 38))
-    d.polygon([(x0 + 22, y0 + 22), (x0 + 108, y0 + 22), (x0 + 65, y0 + 8)],
-              fill=(210, 205, 195))
-    d.rectangle([x0 + 22, y0 + 22, x0 + 108, y0 + 28], fill=(210, 205, 195))
-    for i in range(4):
-        cx = x0 + 32 + i * 20
-        d.rectangle([cx, y0 + 28, cx + 8, y1 - 8], fill=(210, 205, 195))
-    d.rectangle([x0 + 22, y1 - 8, x0 + 108, y1 - 2], fill=(210, 205, 195))
-    d.arc([x1 - 52, y0 + 14, x1 - 26, y0 + 32], 180, 360,
-          fill=(255, 200, 60), width=3)
-    d.rectangle([x1 - 55, y0 + 30, x1 - 23, y1 - 8], fill=RED,
-                outline=(255, 200, 60), width=2)
-    d.ellipse([x1 - 44, y0 + 36, x1 - 34, y0 + 44], fill=(255, 220, 120))
-
-
-def pic_hodeidah(d, box):
-    x0, y0, x1, y1 = box
-    band(d, box, [(200, 220, 235), (170, 200, 220)])
-    d.rectangle([x0, y1 - 18, x1, y1], fill=(30, 80, 120))
-    for cx in (x0 + 24, x0 + 78):
-        d.line([(cx, y0 + 10), (cx, y1 - 18)], fill=(50, 50, 55), width=4)
-        d.line([(cx, y0 + 10), (cx + 34, y0 + 22)], fill=(50, 50, 55),
-               width=3)
-        d.line([(cx + 34, y0 + 22), (cx + 34, y1 - 18)], fill=(50, 50, 55),
-               width=2)
-    d.rectangle([x0 + 118, y1 - 34, x0 + 168, y1 - 18], fill=(40, 40, 46))
-    ex, ey = x1 - 34, y0 + 20
-    d.ellipse([ex - 10, ey - 10, ex + 10, ey + 10], fill=(255, 170, 40))
-    for dx, dy in ((-16, 0), (16, 0), (0, -16), (0, 16)):
-        d.line([(ex, ey), (ex + dx, ey + dy)], fill=(255, 170, 40), width=3)
-    d.text((x0 + 8, y0 + 4), "PORT", font=font(SANS_B, 10), fill=(30, 60, 90))
-
-
-def pic_garment(d, box):
-    x0, y0, x1, y1 = box
-    d.rectangle(box, fill=(240, 235, 215))
-    d.rectangle([x0 + 14, y0 + 22, x0 + 108, y1 - 8], fill=(120, 60, 60))
-    d.polygon([(x0 + 14, y0 + 22), (x0 + 108, y0 + 22), (x0 + 96, y0 + 10),
-               (x0 + 26, y0 + 10)], fill=(90, 40, 40))
+def scene_tariffs(d, x, y, w, h):
+    d.rectangle([x, y, x + w - 1, y + h - 1], fill=SKY)
+    d.rectangle([x, y + h - 26, x + w - 1, y + h - 1], fill=(24, 60, 120))
+    # containers, one row sitting on the deck
+    cols = [(232, 190, 60), (40, 140, 90), (210, 60, 50), (60, 110, 190),
+            (240, 120, 40)]
+    cw = 40
+    for i, c in enumerate(cols):
+        bx = x + 16 + i * (cw + 4)
+        by = y + 36
+        d.rectangle([bx, by, bx + cw, by + 26], fill=c)
+        d.line([(bx + cw // 2, by), (bx + cw // 2, by + 26)], fill=(0, 0, 0), width=1)
+    # hull
+    d.polygon([(x + 8, y + 62), (x + w - 8, y + 62),
+               (x + w - 26, y + h - 8), (x + 26, y + h - 8)], fill=(20, 20, 26))
+    # bridge, right end
+    d.rectangle([x + w - 52, y + 30, x + w - 16, y + 62], fill=(240, 240, 240))
     for i in range(3):
-        wx = x0 + 26 + i * 28
-        d.rectangle([wx, y0 + 32, wx + 18, y0 + 44], fill=(255, 220, 120))
-    d.rectangle([x0 + 118, y0 + 8, x0 + 172, y0 + 32], fill=(20, 120, 80))
-    d.text((x0 + 122, y0 + 12), "+36%", font=font(SANS_B, 14),
+        d.rectangle([x + w - 46, y + 36 + i * 9, x + w - 22, y + 42 + i * 9],
+                    fill=(60, 110, 190))
+    # stamp, top left, clear of the containers
+    d.ellipse([x + 8, y + 4, x + 80, y + 30], outline=RED, width=3)
+    d.text((x + 44, y + 7), "UP TO", font=face("sans-b", 11),
+           fill=RED, anchor="ma")
+    d.text((x + 44, y + 18), "20%", font=face("sans-b", 13),
+           fill=RED, anchor="ma")
+
+
+def scene_hormuz(d, x, y, w, h):
+    d.rectangle([x, y, x + w - 1, y + h - 1], fill=(250, 200, 110))
+    d.ellipse([x + 22, y + 8, x + 62, y + 48], fill=(245, 160, 40))
+    d.rectangle([x, y + h - 30, x + w - 1, y + h - 1], fill=(20, 70, 110))
+    for bx in (x + 14, x + 96):
+        d.rectangle([bx, y + 40, bx + 66, y + 52], fill=(40, 40, 48))
+        d.rectangle([bx + 52, y + 28, bx + 62, y + 40], fill=(40, 40, 48))
+        d.polygon([(bx + 8, y + 40), (bx + 16, y + 30), (bx + 24, y + 40)],
+                  fill=(235, 90, 40))
+    d.text((x + w - 8, y + h - 26), "2 TANKERS", font=face("sans-b", 11),
+           fill=(255, 255, 255), anchor="ra")
+
+
+def scene_solomon(d, x, y, w, h):
+    d.rectangle([x, y, x + w - 1, y + h - 1], fill=(150, 205, 235))
+    d.ellipse([x + w - 46, y + 6, x + w - 10, y + 42], fill=(250, 220, 90))
+    d.polygon([(x, y + h - 1), (x + 60, y + 34), (x + w, y + 52),
+               (x + w, y + h - 1)], fill=(40, 140, 80))
+    d.polygon([(x + 96, y + 52), (x + 108, y + 22), (x + 120, y + 52)],
+              fill=(24, 90, 50))
+    d.rectangle([x + 116, y + 52, x + 120, y + 66], fill=(120, 80, 40))
+    # flag
+    d.rectangle([x + 130, y + 18, x + 132, y + 52], fill=(60, 60, 60))
+    d.polygon([(x + 132, y + 18), (x + 162, y + 25), (x + 132, y + 32)],
+              fill=(30, 60, 160))
+    d.text((x + 8, y + 6), "TREATY", font=face("sans-b", 11), fill=INK)
+
+
+def scene_energy(d, x, y, w, h):
+    d.rectangle([x, y, x + w - 1, y + h - 1], fill=(30, 30, 40))
+    d.polygon([(x + 30, y + 52), (x + 52, y + 14), (x + 74, y + 52)],
+              fill=(245, 150, 40))
+    d.polygon([(x + 40, y + 52), (x + 52, y + 30), (x + 64, y + 52)],
+              fill=(250, 210, 60))
+    d.rectangle([x + w - 92, y + 12, x + w - 12, y + 38], fill=RED)
+    d.text((x + w - 52, y + 16), "+26%", font=face("sans-b", 16),
+           fill=(255, 255, 255), anchor="ma")
+    d.text((x + w - 52, y + 44), "£2,166", font=face("sans-b", 14),
+           fill=(255, 255, 255), anchor="ma")
+
+
+def scene_mine(d, x, y, w, h):
+    d.rectangle([x, y, x + w - 1, y + h - 1], fill=(214, 186, 140))
+    d.polygon([(x + 10, y + 12), (x + w - 10, y + 12), (x + w // 2, y + h - 8)],
+              fill=(120, 82, 48))
+    d.polygon([(x + 60, y + 12), (x + w - 60, y + 12), (x + w // 2, y + h - 26)],
+              fill=(70, 48, 28))
+    d.rectangle([x + w - 62, y + 10, x + w - 12, y + 34], fill=RED)
+    d.text((x + w - 37, y + 13), "26", font=face("sans-b", 15),
+           fill=(255, 255, 255), anchor="ma")
+    d.text((x + 8, y + h - 20), "100 m DOWN", font=face("sans-b", 11),
            fill=(255, 255, 255))
-    d.text((x0 + 118, y0 + 38), "17,500 tk", font=font(SANS_B, 10), fill=INK)
 
 
-def pic_cpi(d, box):
-    x0, y0, x1, y1 = box
-    d.rectangle(box, fill=(232, 228, 245))
-    bars = [(14, 18), (22, 26), (30, 34), (44, 46)]
-    for i, (h0, h1) in enumerate(bars):
-        bx = x0 + 16 + i * 26
-        d.rectangle([bx, y1 - 12 - h1, bx + 18, y1 - 12], fill=(31, 78, 121))
-    d.line([(x0 + 10, y1 - 30), (x1 - 12, y1 - 52)], fill=RED, width=3)
-    d.polygon([(x1 - 12, y1 - 52), (x1 - 24, y1 - 52), (x1 - 14, y1 - 42)],
-              fill=RED)
-    d.text((x1 - 58, y0 + 6), "4.9%", font=font(SANS_B, 16), fill=RED)
+def scene_gaza(d, x, y, w, h):
+    d.rectangle([x, y, x + w - 1, y + h - 1], fill=(222, 210, 190))
+    for bx, bh in ((x + 8, 46), (x + 52, 58), (x + 104, 40), (x + 142, 52)):
+        d.rectangle([bx, y + h - 18 - bh, bx + 40, y + h - 18], fill=(110, 104, 96))
+        for wy in range(2):
+            d.rectangle([bx + 6, y + h - 14 - bh + wy * 16, bx + 14,
+                         y + h - 6 - bh + wy * 16], fill=(60, 58, 54))
+    d.ellipse([x + 120, y + 6, x + 150, y + 30], fill=(150, 146, 140))
+    d.ellipse([x + 140, y + 2, x + 172, y + 26], fill=(170, 166, 160))
+    d.rectangle([x, y + h - 18, x + w - 1, y + h - 1], fill=(90, 86, 80))
 
 
-def pic_ebola(d, box):
-    x0, y0, x1, y1 = box
-    band(d, box, [(178, 208, 222), (214, 226, 228), (232, 226, 205)])
-    # clinic tent
-    d.polygon([(x0 + 18, y1 - 10), (x0 + 60, y0 + 10), (x0 + 102, y1 - 10)],
-              fill=(250, 250, 246), outline=(150, 150, 145))
-    d.rectangle([x0 + 54, y0 + 22, x0 + 66, y0 + 30], fill=RED)
-    d.rectangle([x0 + 58, y0 + 18, x0 + 62, y0 + 34], fill=RED)
-    d.rectangle([x0 + 116, y1 - 30, x0 + 172, y1 - 12], fill=(250, 250, 246),
-                outline=(150, 150, 145), width=2)
-    d.rectangle([x0 + 138, y1 - 26, x0 + 146, y1 - 18], fill=RED)
-    d.rectangle([x0 + 141, y1 - 29, x0 + 143, y1 - 15], fill=RED)
-    d.ellipse([x0 + 122, y1 - 14, x0 + 132, y1 - 4], fill=(30, 30, 30))
-    d.ellipse([x0 + 156, y1 - 14, x0 + 166, y1 - 4], fill=(30, 30, 30))
-    # figure in PPE
-    fx = x1 - 16
-    d.ellipse([fx - 6, y0 + 14, fx + 6, y0 + 26], fill=(240, 240, 235))
-    d.rectangle([fx - 7, y0 + 26, fx + 7, y1 - 10], fill=(240, 240, 235))
-    d.rectangle([fx - 7, y0 + 26, fx + 7, y0 + 32], fill=(70, 120, 180))
-    d.rectangle([x0, y1 - 8, x1, y1], fill=(198, 178, 140))
+def scene_cia(d, x, y, w, h):
+    d.rectangle([x, y, x + w - 1, y + h - 1], fill=(18, 22, 38))
+    # capitol-ish building
+    d.rectangle([x + 18, y + 30, x + 84, y + h - 14], fill=(235, 232, 225))
+    d.polygon([(x + 14, y + 30), (x + 51, y + 12), (x + 88, y + 30)],
+              fill=(235, 232, 225))
+    for i in range(4):
+        d.rectangle([x + 24 + i * 16, y + 38, x + 32 + i * 16, y + h - 14],
+                    fill=(180, 176, 168))
+    # padlock
+    lx, ly = x + 118, y + 26
+    d.rectangle([lx + 4, ly + 14, lx + 36, ly + 42], fill=RED)
+    d.arc([lx + 8, ly, lx + 32, ly + 20], 180, 360, fill=(255, 220, 60), width=4)
+    d.ellipse([lx + 17, ly + 24, lx + 23, ly + 30], fill=(255, 220, 60))
 
 
-LEAD_PIC = {1: pic_kospi, 2: pic_tiangong, 3: pic_tariff}
-GRID_PIC = {4: pic_hormuz, 5: pic_solomon, 6: pic_energy, 7: pic_mine,
-            8: pic_gaza, 9: pic_cia, 10: pic_hodeidah, 11: pic_garment,
-            12: pic_cpi, 13: pic_ebola}
+def scene_port(d, x, y, w, h):
+    d.rectangle([x, y, x + w - 1, y + h - 1], fill=(240, 220, 170))
+    d.ellipse([x + w - 52, y + 8, x + w - 14, y + 46], fill=(250, 190, 60))
+    d.rectangle([x, y + h - 16, x + w - 1, y + h - 1], fill=(40, 90, 130))
+    for cx in (x + 20, x + 86):
+        d.line([(cx, y + h - 16), (cx, y + 14)], fill=(60, 60, 60), width=3)
+        d.line([(cx, y + 14), (cx + 44, y + 14)], fill=(60, 60, 60), width=3)
+        d.line([(cx + 44, y + 14), (cx + 36, y + h - 16)], fill=(60, 60, 60), width=2)
+    d.text((x + 8, y + 6), "PORT", font=face("sans-b", 11), fill=INK)
 
-REGION_COLORS = {
-    "EUROPE": (31, 78, 121),
-    "AMERICAS": (106, 61, 154),
-    "ASIA-PACIFIC": (14, 122, 107),
-    "MIDDLE EAST": (176, 124, 12),
-    "AFRICA": (196, 94, 26),
-    "WORLD": (85, 85, 85),
+
+def scene_garment(d, x, y, w, h):
+    d.rectangle([x, y, x + w - 1, y + h - 1], fill=(250, 230, 150))
+    d.rectangle([x + 16, y + 26, x + 116, y + h - 12], fill=(230, 190, 80))
+    for i in range(4):
+        d.rectangle([x + 24 + i * 24, y + 34, x + 40 + i * 24, y + 48],
+                    fill=(120, 80, 30))
+    d.polygon([(x + 12, y + 26), (x + 66, y + 8), (x + 120, y + 26)],
+              fill=(180, 60, 50))
+    d.rectangle([x + w - 78, y + 8, x + w - 10, y + 32], fill=(20, 130, 70))
+    d.text((x + w - 44, y + 11), "+36%", font=face("sans-b", 14),
+           fill=(255, 255, 255), anchor="ma")
+    d.text((x + w - 44, y + 38), "17,500 tk", font=face("sans-b", 11),
+           fill=INK, anchor="ma")
+
+
+def scene_inflation(d, x, y, w, h):
+    d.rectangle([x, y, x + w - 1, y + h - 1], fill=(240, 235, 250))
+    for i in range(5):
+        gy = y + 12 + i * 12
+        d.line([(x + 10, gy), (x + w - 10, gy)], fill=(210, 205, 220), width=1)
+    pts = [(x + 16, y + h - 18), (x + 56, y + h - 26), (x + 96, y + h - 34),
+           (x + 136, y + h - 48), (x + w - 16, y + 14)]
+    d.line(pts, fill=(140, 40, 160), width=3)
+    d.ellipse([x + w - 22, y + 8, x + w - 10, y + 20], fill=(140, 40, 160))
+    d.text((x + 10, y + 6), "4.9%", font=face("sans-b", 16), fill=RED)
+
+
+def scene_ebola(d, x, y, w, h):
+    d.rectangle([x, y, x + w - 1, y + h - 1], fill=(215, 232, 240))
+    d.polygon([(x + 16, y + h - 18), (x + 66, y + 18), (x + 116, y + h - 18)],
+              fill=(245, 245, 240))
+    d.rectangle([x + 60, y + 34, x + 72, y + 58], fill=RED)
+    d.rectangle([x + 52, y + 42, x + 80, y + 50], fill=RED)
+    # ambulance
+    ax, ay = x + 118, y + h - 40
+    d.rectangle([ax, ay, ax + 62, ay + 26], fill=(255, 255, 255))
+    d.rectangle([ax + 44, ay + 4, ax + 62, ay + 26], fill=(240, 240, 240))
+    d.rectangle([ax + 26, ay + 8, ax + 34, ay + 18], fill=RED)
+    d.rectangle([ax + 36, ay + 8, ax + 42, ay + 18], fill=RED)
+    d.ellipse([ax + 10, ay + 22, ax + 20, ay + 32], fill=(30, 30, 30))
+    d.ellipse([ax + 44, ay + 22, ax + 54, ay + 32], fill=(30, 30, 30))
+
+
+SCENES = {
+    1: scene_kospi, 2: scene_space, 3: scene_tariffs, 4: scene_hormuz,
+    5: scene_solomon, 6: scene_energy, 7: scene_mine, 8: scene_gaza,
+    9: scene_cia, 10: scene_port, 11: scene_garment, 12: scene_inflation,
+    13: scene_ebola,
 }
 
+# ---------------------------------------------------------------- sections
 
-def draw_map(d, box):
-    x0, y0, x1, y1 = box
-    d.rectangle(box, fill=(220, 235, 245), outline=(150, 160, 165), width=1)
-    land = (232, 217, 168)
-    d.polygon([(x0 + 28, y0 + 22), (x0 + 78, y0 + 14), (x0 + 96, y0 + 30),
-               (x0 + 82, y0 + 48), (x0 + 56, y0 + 44), (x0 + 34, y0 + 52),
-               (x0 + 22, y0 + 38)], fill=land)
-    d.polygon([(x0 + 62, y0 + 66), (x0 + 88, y0 + 62), (x0 + 94, y0 + 84),
-               (x0 + 78, y0 + 108), (x0 + 66, y0 + 92)], fill=land)
-    d.polygon([(x0 + 148, y0 + 22), (x0 + 172, y0 + 16), (x0 + 182, y0 + 30),
-               (x0 + 166, y0 + 40), (x0 + 148, y0 + 34)], fill=land)
-    d.polygon([(x0 + 150, y0 + 48), (x0 + 182, y0 + 44), (x0 + 192, y0 + 66),
-               (x0 + 178, y0 + 96), (x0 + 160, y0 + 82)], fill=land)
-    d.polygon([(x0 + 184, y0 + 18), (x0 + 268, y0 + 12), (x0 + 288, y0 + 34),
-               (x0 + 262, y0 + 56), (x0 + 228, y0 + 52), (x0 + 204, y0 + 62),
-               (x0 + 186, y0 + 42)], fill=land)
-    d.polygon([(x0 + 252, y0 + 92), (x0 + 284, y0 + 88), (x0 + 290, y0 + 104),
-               (x0 + 262, y0 + 110)], fill=land)
-    pins = [(1, 262, 34), (2, 238, 30), (3, 44, 38), (4, 178, 58),
-            (5, 288, 100), (6, 138, 24), (7, 246, 82), (8, 164, 50),
-            (9, 66, 50), (10, 168, 66), (11, 222, 52), (12, 292, 108),
-            (13, 152, 76)]
-    for n, px, py in pins:
-        d.ellipse([x0 + px - 8, y0 + py - 8, x0 + px + 8, y0 + py + 8],
-                  fill=RED, outline=(255, 255, 255), width=1)
-        d.text((x0 + px - 3, y0 + py - 6), str(n), font=font(SANS_B, 10),
-               fill=(255, 255, 255))
-
-
-def main():
-    with open(DATA, encoding="utf-8") as fh:
-        data = json.load(fh)
-    img = Image.new("RGB", (W, H), CREAM)
-    d = ImageDraw.Draw(img)
-    mx = 24
-    cw = W - 2 * mx
-
-    # ---- top black bar
-    d.rectangle([0, 0, W, 28], fill=(16, 16, 16))
-    d.text((mx, 7), "THE WORLD ON WEDNESDAY", font=font(SANS_B, 13),
-           fill=(255, 255, 255))
+def sec_topbar(p, data):
+    p.bar(26, BLACK)
+    p.d.text((MARGIN, 5), data["paper"].upper(), font=face("sans-b", 12),
+             fill=(255, 255, 255))
     right = "36 STORIES · 6 REGIONS · EVERY ONE DATED WEDNESDAY 25 NOVEMBER 2026"
-    d.text((W - mx - d.textlength(right, font=font(SANS_B, 13)), 7), right,
-           font=font(SANS_B, 13), fill=(255, 255, 255))
+    p.d.text((W - MARGIN, 5), right, font=face("sans-b", 12),
+             fill=(255, 255, 255), anchor="ra")
+    p.y += 4
 
-    # ---- masthead: the date, giant
-    mast = fit_font(d, "Wednesday 25 November 2026", SERIF_B, 58, cw)
-    d.text((mx, 32), "Wednesday 25 November 2026", font=mast, fill=INK)
-    sub = ("Kospi crashes -6.2% · Pakistan's first astronaut docks at Tiangong "
-           "· US proposes tariffs of up to 20%")
-    subf = fit_font(d, sub, SERIF_I, 18, cw, minimum=13)
-    d.text((mx, 100), sub, font=subf, fill=RED)
-    d.line([(mx, 124), (W - mx, 124)], fill=RULE, width=2)
 
-    # ---- numbers strip: six big red figures
-    nums = data["numbers"]
-    cell = cw / 6
-    y = 130
-    for i, item in enumerate(nums):
-        x = mx + i * cell
+def sec_masthead(p, data):
+    p.d.text((MARGIN, p.y), "Wednesday 25 November 2026",
+             font=face("serif-b", 54), fill=INK)
+    p.y += 66
+    sub = ("Kospi crashes −6.2% · Pakistan's first astronaut docks at "
+           "Tiangong · US proposes tariffs of up to 20%")
+    p.d.text((MARGIN, p.y), sub, font=face("serif-i", 19), fill=RED)
+    p.y += 24
+
+
+def sec_numbers(p, data):
+    p.rule(2, INK, gap=6)
+    cols = 6
+    cell = CW // cols
+    top = p.y
+    for i, item in enumerate(data["numbers"]):
+        x = MARGIN + i * cell
         if i:
-            d.line([(x, y + 4), (x, y + 50)], fill=(200, 190, 170), width=1)
-        nf = fit_font(d, item["value"], SERIF_B, 34, cell - 16, minimum=18)
-        d.text((x + 8, y), item["value"], font=nf, fill=RED)
-        cap = wrap(d, item["label"], font(SANS, 10), cell - 16)
-        text_block(d, (x + 8, y + 38), cap[:1], font(SANS, 10), INK,
-                   leading=12)
-    d.line([(mx, 186), (W - mx, 186)], fill=RULE, width=1)
+            p.d.line([(x, top + 2), (x, top + 42)], fill=GREY, width=1)
+        p.d.text((x + 8, top), item["value"], font=face("serif-b", 28),
+                 fill=RED)
+        p.d.text((x + 8, top + 32), item["label"], font=face("sans", 10),
+                 fill=INK)
+    p.y = top + 46
+    p.rule(1, INK, gap=6)
 
-    # ---- the day in UTC
-    d.rectangle([mx, 190, W - mx, 212], fill=(16, 16, 16))
-    d.text((mx + 8, 195), "THE DAY IN UTC", font=font(SANS_B, 12),
-           fill=(255, 200, 60))
-    parts = []
-    for item in data["utc"]:
-        parts.append(f"{item['time']} {item['event']}")
-    strip = "   ·   ".join(parts)
-    sf = fit_font(d, strip, SANS_B, 12, cw - 150, minimum=9)
-    d.text((mx + 132, 195), strip, font=sf, fill=(255, 255, 255))
 
-    # ---- region bars
-    regs = data["regions"]
+def sec_utc(p, data):
+    p.bar(20, BLACK)
+    p.d.text((MARGIN, p.y - 20 + 3), "THE DAY IN UTC", font=face("sans-b", 11),
+             fill=(255, 200, 60))
+    bits, x = [], MARGIN + 118
+    for ev in data["utc"]:
+        bits.append((x, ev))
+        x += int(face("sans", 10).getlength(ev["time"] + "  " + ev["event"] + "   ·   "))
+    for x0, ev in bits:
+        p.d.text((x0, p.y - 20 + 4), ev["time"], font=face("sans-b", 10),
+                 fill=(255, 255, 255))
+        w = face("sans-b", 10).getlength(ev["time"] + " ")
+        p.d.text((x0 + w, p.y - 20 + 4), ev["event"], font=face("sans", 10),
+                 fill=(220, 220, 220))
+    p.y += 5
+
+
+def sec_regions(p, data):
     order = ["EUROPE", "AMERICAS", "ASIA-PACIFIC", "MIDDLE EAST", "AFRICA",
              "WORLD"]
-    total = sum(regs.values())
-    x = mx
-    y = 216
+    total = sum(data["regions"].values())
+    x = MARGIN
     for name in order:
-        wseg = cw * regs[name] / total
-        d.rectangle([x, y, x + wseg - 2, y + 18], fill=REGION_COLORS[name])
-        label = f"{name} {regs[name]}"
-        lf = font(SANS_B, 10)
-        if d.textlength(label, font=lf) <= wseg - 8:
-            d.text((x + 5, y + 4), label, font=lf, fill=(255, 255, 255))
-        x += wseg
-    d.line([(mx, 238), (W - mx, 238)], fill=RULE, width=1)
+        w = int(CW * data["regions"][name] / total)
+        p.d.rectangle([x, p.y, x + w - 1, p.y + 15], fill=REGION_FILL[name])
+        p.d.text((x + 5, p.y + 2), "%s %d" % (name, data["regions"][name]),
+                 font=face("sans-b", 9), fill=(255, 255, 255))
+        x += w
+    p.y += 19
 
-    # ---- three illustrated leads
-    colw = (cw - 16) / 3
-    y0 = 246
-    ill_h = 110
-    for i, lead in enumerate(data["leads"]):
-        x = mx + i * (colw + 8)
-        LEAD_PIC[lead["pin"]](d, (int(x), y0, int(x + colw), y0 + ill_h))
-        d.rectangle([int(x), y0 + ill_h, int(x + colw), y0 + ill_h + 18],
-                    fill=RED)
-        d.text((x + 6, y0 + ill_h + 3), lead["kicker"], font=font(SANS_B, 11),
-               fill=(255, 255, 255))
-        d.text((x, y0 + ill_h + 22), f"{lead['pin']} {lead['place']}",
-               font=font(SANS_B, 10), fill=RED)
-        head = wrap(d, lead["headline"], font(SERIF_B, 24), colw)
-        yy = text_block(d, (x, y0 + ill_h + 36), head[:2],
-                        font(SERIF_B, 24), INK, leading=27)
-        deck = wrap(d, lead["deck"], font(SANS, 12), colw)
-        yy = text_block(d, (x, yy + 3), deck[:2], font(SANS, 12), INK,
-                        leading=14)
-        d.text((x, yy + 2), f"({lead['source']})", font=font(SERIF_I, 10),
-               fill=GREY)
 
-    # ---- grid: ten illustrated stories, two rows of five
-    grid = sorted(data["grid"], key=lambda g: g["pin"])
-    colw2 = (cw - 32) / 5
-    for row in range(2):
-        y0 = 494 + row * 140
-        ill_h2 = 58
-        for i in range(5):
-            item = grid[row * 5 + i]
-            x = mx + i * (colw2 + 8)
-            GRID_PIC[item["pin"]](d, (int(x), y0, int(x + colw2), y0 + ill_h2))
-            d.rectangle([int(x), y0 + ill_h2, int(x + colw2),
-                         y0 + ill_h2 + 15], fill=RED)
-            d.text((x + 5, y0 + ill_h2 + 2), item["kicker"],
-                   font=font(SANS_B, 9), fill=(255, 255, 255))
-            head = wrap(d, item["headline"], font(SERIF_B, 15), colw2)
-            yy = text_block(d, (x, y0 + ill_h2 + 19), head[:2],
-                            font(SERIF_B, 15), INK, leading=17)
-            deck = wrap(d, item["deck"], font(SANS, 10), colw2)
-            text_block(d, (x, yy + 2), deck[:2], font(SANS, 10), INK,
-                       leading=12)
+def _story_block(p, story, x, y, w, img_h, head_size, deck_size):
+    """Illustration + kicker + place + headline + deck + source."""
+    d = p.d
+    SCENES[story["pin"]](d, x, y, w, img_h)
+    y += img_h
+    y = p.kicker_strip(x, y, w, story["kicker"])
+    y += 3
+    d.text((x, y), story["place"], font=face("sans-b", 11), fill=RED)
+    y += 14
+    y = p.para(x, y, story["headline"], face("serif-b", head_size), w,
+               leading=head_size + 3)
+    y += 2
+    y = p.para(x, y, story["deck"], face("serif", deck_size), w,
+               leading=deck_size + 3)
+    y += 2
+    d.text((x, y), "(%s)" % story["source"], font=face("serif-i", 10),
+           fill=MIDGREY)
+    return y + 12
 
-    # ---- map + ALSO list
-    y0 = 782
-    d.text((mx, y0), "WHERE IT HAPPENED · pins match story numbers",
-           font=font(SANS_B, 11), fill=INK)
-    also_head = "ALSO ON WEDNESDAY 25 NOVEMBER — 23 MORE STORIES"
-    d.text((W - mx - d.textlength(also_head, font=font(SANS_B, 11)), y0),
-           also_head, font=font(SANS_B, 11), fill=RED)
-    draw_map(d, (mx, y0 + 20, mx + 316, y0 + 140))
-    ax = mx + 328
-    items = data["also"]
-    per_col = 12
-    for col in range(2):
-        cx = ax + col * 322
-        for j in range(per_col):
-            idx = col * per_col + j
-            if idx >= len(items):
-                break
-            item = items[idx]
-            yy = y0 + 22 + j * 10
-            d.text((cx, yy), str(item["n"]), font=font(SANS_B, 10), fill=RED)
+
+def sec_leads(p, data):
+    gap, cols = 14, 3
+    cell = (CW - gap * (cols - 1)) // cols
+    top = p.y
+    bottom = top
+    for i, story in enumerate(data["leads"]):
+        x = MARGIN + i * (cell + gap)
+        end = _story_block(p, story, x, top, cell, 92, 24, 12)
+        bottom = max(bottom, end)
+    p.y = bottom + 2
+
+
+def sec_grid(p, data, rows):
+    gap, cols = 12, 5
+    cell = (CW - gap * (cols - 1)) // cols
+    for row in rows:
+        top = p.y
+        bottom = top
+        for j, story in enumerate(row):
+            x = MARGIN + j * (cell + gap)
+            end = _story_block(p, story, x, top, cell, 58, 14, 10)
+            bottom = max(bottom, end)
+        p.y = bottom + 2
+
+
+def _pin_xy(bx, by, bw, bh, lon, lat):
+    return (bx + (lon + 180.0) / 360.0 * bw,
+            by + (90.0 - lat) / 180.0 * bh)
+
+
+def sec_map_also(p, data):
+    p.d.text((MARGIN, p.y), "WHERE IT HAPPENED · pins match story numbers",
+             font=face("sans-b", 11), fill=INK)
+    p.d.text((W - MARGIN, p.y), "ALSO ON WEDNESDAY 25 NOVEMBER — 23 MORE STORIES",
+             font=face("sans-b", 11), fill=RED, anchor="ra")
+    p.y += 16
+    top = p.y
+    map_w, map_h = 330, 112
+    d = p.d
+    d.rectangle([MARGIN, top, MARGIN + map_w - 1, top + map_h - 1],
+                fill=(205, 225, 240))
+    # rough continents, tan on pale blue
+    continents = [
+        [(14, 26), (58, 8), (96, 16), (88, 52), (52, 66), (20, 52)],
+        [(72, 72), (96, 70), (104, 96), (82, 110), (68, 92)],
+        [(168, 22), (196, 12), (214, 26), (200, 46), (176, 40)],
+        [(176, 52), (206, 50), (216, 78), (196, 104), (180, 82)],
+        [(222, 20), (300, 10), (322, 34), (296, 58), (262, 66), (228, 48)],
+        [(292, 92), (318, 88), (324, 104), (300, 110)],
+    ]
+    for poly in continents:
+        d.polygon([(MARGIN + px, top + py) for px, py in poly], fill=TAN)
+    pins = {1: (127, 38), 2: (99, 40), 3: (-77, 39), 4: (56, 26),
+            5: (160, -9), 6: (0, 51), 7: (107, -7), 8: (34, 31),
+            9: (-95, 32), 10: (43, 15), 11: (90, 24), 12: (151, -34),
+            13: (29, 1)}
+    for n, (lon, lat) in pins.items():
+        px, py = _pin_xy(MARGIN, top, map_w, map_h, lon, lat)
+        d.ellipse([px - 8, py - 8, px + 8, py + 8], fill=RED,
+                  outline=(255, 255, 255), width=1)
+        d.text((px, py - 5), str(n), font=face("sans-b", 8),
+               fill=(255, 255, 255), anchor="ma")
+    # ALSO list, two columns
+    also = data["also"]
+    col_x = [MARGIN + map_w + 16, MARGIN + map_w + 16 + 300]
+    col_w = 292
+    half = 12
+    for ci, chunk in enumerate((also[:half], also[half:])):
+        y = top + 1
+        for item in chunk:
+            num = "%d " % item["n"]
+            d.text((col_x[ci], y), num, font=face("sans-b", 9), fill=RED)
+            nw = face("sans-b", 9).getlength(num)
             head = item["headline"]
-            src = item["source"]
-            lf = font(SANS, 10)
-            while d.textlength(head + " · " + src, font=lf) > 296 \
-                    and len(head) > 12:
-                head = head[:-4] + "…"
-            d.text((cx + 20, yy), head + " · " + src, font=lf, fill=INK)
+            if face("sans", 9).getlength(head) > col_w - nw - 62:
+                while face("sans", 9).getlength(head + "…") > col_w - nw - 62:
+                    head = head[:-1]
+                head += "…"
+            d.text((col_x[ci] + nw, y), head, font=face("sans", 9), fill=INK)
+            sw = face("sans", 9).getlength(head)
+            d.text((col_x[ci] + nw + sw + 4, y), "· " + item["source"],
+                   font=face("sans-i", 8), fill=MIDGREY)
+            y += 9
+    p.y = top + map_h + 6
 
-    # ---- date check
-    y0 = 934
-    d.rectangle([mx, y0, W - mx, y0 + 52], outline=RED, width=2)
-    d.text((mx + 8, y0 + 4), "DATE CHECK", font=font(SANS_B, 12), fill=RED)
-    note = (data["date_check"]["note"] + " "
-            + data["date_check"]["left_out"])
-    nf = font(SANS, 10)
-    lines = wrap(d, note, nf, cw - 16)
-    text_block(d, (mx + 8, y0 + 20), lines[:2], nf, INK, leading=13)
 
-    # ---- footer
-    d.text((mx, 996), "Sources named beside each story · Original drawings, drawn in code.",
-           font=font(SERIF_I, 10), fill=GREY)
-    foot = "THE WORLD ON WEDNESDAY · 25 NOV 2026"
-    d.text((W - mx - d.textlength(foot, font=font(SANS_B, 10)), 996), foot,
-           font=font(SANS_B, 10), fill=INK)
+def sec_datecheck(p, data):
+    top = p.y
+    d = p.d
+    d.rectangle([MARGIN, top, W - MARGIN - 1, top + 58], outline=RED, width=2)
+    d.text((MARGIN + 8, top + 4), "DATE CHECK", font=face("sans-b", 11),
+           fill=RED)
+    y = p.para(MARGIN + 8, top + 18, data["date_check"]["note"],
+               face("sans", 10), CW - 16, leading=12)
+    y = p.para(MARGIN + 8, y, data["date_check"]["left_out"],
+               face("sans", 10), CW - 16, leading=12)
+    p.y = top + 60
 
-    img.save(OUT, format="PNG")
-    print(f"wrote {OUT} {os.path.getsize(OUT)} bytes")
+
+def sec_footer(p, data):
+    p.d.text((MARGIN, p.y), "Sources named beside each story · Original "
+             "drawings, drawn in code.", font=face("sans-i", 10),
+             fill=MIDGREY)
+    p.d.text((W - MARGIN, p.y), "THE WORLD ON WEDNESDAY · 25 NOV 2026",
+             font=face("sans-b", 10), fill=INK, anchor="ra")
+    p.y += 14
+
+
+SECTIONS = [
+    sec_topbar, sec_masthead, sec_numbers, sec_utc, sec_regions,
+    sec_leads,
+    lambda p, data: sec_grid(p, data, [sorted(data["grid"],
+                                              key=lambda s: s["pin"])[:5]]),
+    lambda p, data: sec_grid(p, data, [sorted(data["grid"],
+                                              key=lambda s: s["pin"])[5:]]),
+    sec_map_also, sec_datecheck, sec_footer,
+]
+
+
+def build(data_path, out_path):
+    data = load_data(data_path)
+    p = Page()
+    for section in SECTIONS:
+        section(p, data)
+    print("final cursor y =", p.y, "(canvas height", H, ")")
+    assert p.y <= H, "layout overflow: %d > %d" % (p.y, H)
+    p.img.save(out_path, format="PNG", optimize=True)
+    return out_path
 
 
 if __name__ == "__main__":
-    main()
+    here = os.path.dirname(os.path.abspath(__file__))
+    build(os.path.join(here, "stories_20261125-v3.json"),
+          os.path.join(here, "entry.png"))

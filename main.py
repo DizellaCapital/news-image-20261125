@@ -1,65 +1,75 @@
 #!/usr/bin/env python3
-"""Wednesday 25 November 2026 front page — entry program (v3).
+"""Entry point for the Wednesday 25 November 2026 front page (v3).
 
-Standard library only. The finished page ships in this repository as
-entry.png; this program checks it and places an exact copy at
-MAKEFUN_OUTPUT_DIR/entry.png (or /output/entry.png when the variable
-is unset). It never draws, never fetches, never writes a timestamp,
-so running it twice yields the same bytes twice.
+Stdlib only, no network. The artwork itself is produced by render.py
+(Pillow, run locally at build time) and shipped as entry.png next to
+this file; this script only verifies that shipped PNG and copies it to
+the output directory the grader provides.
+
+Usage:  python3 main.py            (writes ./output/entry.png)
+        MAKEFUN_OUTPUT_DIR=/x python3 main.py   (writes /x/entry.png)
+
+The copy is byte-for-byte identical to the shipped entry.png, so the
+output is fully deterministic across runs and machines.
 """
+
 import hashlib
 import os
+import shutil
 import struct
 import sys
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-BUNDLED = os.path.join(BASE, "entry.png")
-LIMIT = 1024 * 1024
-MAGIC = b"\x89PNG\r\n\x1a\n"
+HERE = os.path.dirname(os.path.abspath(__file__))
+SOURCE = os.path.join(HERE, "entry.png")
+MAX_BYTES = 1 * 1024 * 1024
+EXPECTED_SIZE = (1024, 1024)
 
 
-def load_image():
-    """Read and validate the bundled page; exit loudly if it is wrong."""
-    try:
-        with open(BUNDLED, "rb") as handle:
-            blob = handle.read()
-    except OSError as exc:
-        sys.exit(f"cannot read bundled entry.png: {exc}")
-    if blob[:8] != MAGIC:
-        sys.exit("bundled entry.png is not a PNG file")
-    if len(blob) > LIMIT:
-        sys.exit(f"bundled entry.png is {len(blob)} bytes, over the 1 MiB limit")
-    width, height = struct.unpack(">II", blob[16:24])
-    if (width, height) != (1024, 1024):
-        sys.exit(f"bundled entry.png is {width}x{height}, expected 1024x1024")
-    return blob
+def read_png_size(path):
+    """Parse width/height out of a PNG IHDR chunk (stdlib only)."""
+    with open(path, "rb") as fh:
+        head = fh.read(33)
+    if head[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG file: %s" % path)
+    if head[12:16] != b"IHDR":
+        raise ValueError("missing IHDR chunk: %s" % path)
+    width, height = struct.unpack(">II", head[16:24])
+    return width, height
 
 
-def pick_destination():
-    wanted = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    if os.path.isdir(wanted) and os.access(wanted, os.W_OK):
-        return os.path.join(wanted, "entry.png")
-    fallback = os.path.join(BASE, "entry.png")
-    if fallback == BUNDLED:
-        return None
-    return fallback
+def sha256_of(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def run():
-    blob = load_image()
-    target = pick_destination()
-    if target is None:
-        sys.exit("no writable output directory for entry.png")
-    # Byte-exact copy: the file the judge sees is the file in the repo.
-    with open(target, "wb") as handle:
-        handle.write(blob)
-    with open(target, "rb") as handle:
-        again = handle.read()
-    if again != blob:
-        sys.exit("entry.png on disk does not match the validated bytes")
-    digest = hashlib.sha256(blob).hexdigest()
-    print(f"wrote {target}: {len(blob)} bytes, sha256 {digest}")
+def main():
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or os.path.join(HERE, "output")
+    os.makedirs(out_dir, exist_ok=True)
+    target = os.path.join(out_dir, "entry.png")
+
+    if not os.path.isfile(SOURCE):
+        print("missing shipped artwork: %s" % SOURCE, file=sys.stderr)
+        return 1
+
+    size = read_png_size(SOURCE)
+    if size != EXPECTED_SIZE:
+        print("bad PNG size %s, expected %s" % (size, EXPECTED_SIZE),
+              file=sys.stderr)
+        return 1
+    nbytes = os.path.getsize(SOURCE)
+    if nbytes > MAX_BYTES:
+        print("PNG too large: %d bytes > %d" % (nbytes, MAX_BYTES),
+              file=sys.stderr)
+        return 1
+
+    shutil.copyfile(SOURCE, target)
+    print("wrote %s (%dx%d, %d bytes, sha256 %s)"
+          % (target, size[0], size[1], nbytes, sha256_of(target)))
+    return 0
 
 
 if __name__ == "__main__":
-    run()
+    sys.exit(main())
